@@ -1,0 +1,19 @@
+# 密钥
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# 运行时产物
+logs/
+data/chroma/
+data/voc.db
+*.db
+
+# IDE
+.vscode/
+.idea/
