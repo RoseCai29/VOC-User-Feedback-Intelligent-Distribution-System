@@ -1,0 +1,53 @@
+{
+  "dataset": "data/real/eval_real_test.jsonl",
+  "mode": "llm",
+  "total": 20,
+  "level1_accuracy": 0.7,
+  "level2_accuracy": 0.55,
+  "pipeline_success_rate": 1.0,
+  "degraded_rate": 0.0,
+  "degraded_by_tool": {},
+  "escalation_rate": 0.0,
+  "fast_path_rate": 0.55,
+  "avg_steps": 18.2,
+  "p95_steps": 37.0,
+  "max_retry_observed": 0,
+  "avg_loops": 5.6,
+  "avg_latency_ms": 5333.4,
+  "p95_latency_ms": 22697.6,
+  "llm_prompt_tokens_total": 110900,
+  "llm_completion_tokens_total": 2854,
+  "avg_llm_tokens_per_case": 5687.7,
+  "misclassified": [
+    {
+      "text": "小米能走到今天走的是亲民路线，但是这几年的小米真的是垃圾中的垃圾，家里好多东西都",
+      "gold": "舆情吐槽/服务态度",
+      "pred": "正向反馈/产品好评"
+    },
+    {
+      "text": "米家⭐️⭐️⭐️⭐️⭐️👍",
+      "gold": "正向反馈/产品好评",
+      "pred": "作品建议/功能建议"
+    },
+    {
+      "text": "因为本人有1型糖尿病，所以身上带有欧态血糖仪，因为有时候开车看不了手机，就不能时",
+      "gold": "作品建议/功能建议",
+      "pred": "正向反馈/产品好评"
+    },
+    {
+      "text": "评价维修服务点的内容无法上传。 \n店铺的经营范围、服务范围与实际严重脱节。\n说明",
+      "gold": "舆情吐槽/服务态度",
+      "pred": "售后报修/服务态度"
+    },
+    {
+      "text": "天天更新更你🪵呢？我不更新还不能开空调了？哪里来的霸王条款",
+      "gold": "舆情吐槽/产品质量",
+      "pred": "作品建议/功能建议"
+    },
+    {
+      "text": "但是为什么苹果上不了下载东西？",
+      "gold": "作品建议/功能建议",
+      "pred": "售后报修/软件缺陷"
+    }
+  ]
+}

@@ -13,16 +13,22 @@ class TestClassify:
         r = json.loads(classify("建议增加夜间模式"))
         assert r["category"] == "作品建议"
 
+    def test_recommend_complaint_not_positive(self):
+        # 「推荐」是好评词，但推荐算法吐槽不能判成正向反馈
+        r = json.loads(classify("推荐算法不准确，总是推不感兴趣的内容"))
+        assert r["category"] == "作品建议"
+        assert r["sub_category"] == "内容推荐"
+
     def test_sentiment(self):
         r = json.loads(classify("客服态度太差了"))
         assert r["category"] == "舆情吐槽"
 
     def test_low_confidence(self):
-        r = json.loads(classify("这个APP真的不好用啊"))
+        r = json.loads(classify("这个APP真的不行了"))
         assert r["confidence"] < 0.7
 
     def test_with_evidence(self):
-        r = json.loads(classify("这个APP真的不好用啊", evidence_context="闪退崩溃需要保修"))
+        r = json.loads(classify("这个APP真的不行了", evidence_context="闪退崩溃需要保修"))
         assert r["confidence"] > 0.7
         assert "证据纠正" in r["tags"]
 

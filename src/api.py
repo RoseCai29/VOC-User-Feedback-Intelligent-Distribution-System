@@ -20,7 +20,7 @@ from .config import get_settings
 from .logging_config import setup_logging, get_logger
 from .graph import run_feedback_invoke
 from .state import XiaomiProductLine
-from .db import init_db, FeedbackRecord, persist_feedback, get_session
+from .db import init_db, FeedbackRecord, persist_feedback, get_session, record_from_state
 
 setup_logging()
 logger = get_logger(__name__)
@@ -81,6 +81,8 @@ class FeedbackResponse(BaseModel):
     trace_steps: int = 0
     elapsed_ms: float = 0.0
     mode: str = "agent"
+    degraded: bool = False
+    errors: list[str] = []
 
 
 class HealthResponse(BaseModel):
@@ -118,29 +120,11 @@ async def process_feedback(req: FeedbackRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     cls = state.classification
+    bucket = state.dedup_bucket
     rt = state.route_target
     guide = state.service_guide
-    bucket = state.dedup_bucket
 
-    record = FeedbackRecord(
-        id=state.feedback_id, raw_text=req.raw_text, source=req.source,
-        product_line=req.product_line,
-        category=cls.category.value if cls else None,
-        sub_category=cls.sub_category.value if cls else None,
-        confidence=cls.confidence if cls else None,
-        tags=json.dumps(cls.tags) if cls and cls.tags else None,
-        is_duplicate=state.is_duplicate,
-        dedup_bucket_id=bucket.bucket_id if bucket and state.is_duplicate else None,
-        route_assignee=rt.assignee if rt else None,
-        guide_phone=guide.phone if guide else None,
-        guide_link=guide.link if guide else None,
-        retry_count=state.retry_count,
-        trace_json=json.dumps([
-            {"step_id": s.step_id, "thought": s.thought, "action": s.action,
-             "observation": s.observation[:100]}
-            for s in state.trace
-        ], ensure_ascii=False),
-    )
+    record = record_from_state(state, req.product_line)
     persist_feedback(record)
     _feedback_count += 1
 
@@ -158,7 +142,10 @@ async def process_feedback(req: FeedbackRequest):
         retry_count=state.retry_count,
         trace_steps=len(state.trace),
         elapsed_ms=round((time.time() - t0) * 1000, 1),
-        mode="llm_agent" if not cfg.use_deterministic else "deterministic",
+        mode=("fast_path" if state.fast_path
+              else "llm_agent" if not cfg.use_deterministic else "deterministic"),
+        degraded=bool(state.errors),
+        errors=state.errors,
     )
 
 

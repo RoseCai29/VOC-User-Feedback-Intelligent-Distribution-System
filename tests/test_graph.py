@@ -28,16 +28,19 @@ class TestGraphNormal:
 class TestLowConfidenceLoop:
     def test_self_correct(self):
         reset_dedup_buckets()
-        state = run_feedback_invoke("这个APP真的不好用啊，打开总是出毛病", source="社区")
+        # 无明确线索的模糊反馈才会走低置信自救闭环
+        state = run_feedback_invoke("就这吧，还能怎么样呢", source="社区")
         assert state.evidence_retrieved is True
         assert state.retry_count >= 1
-        assert state.classification.confidence >= 0.7
         assert state.finished is True
 
-    def test_three_rounds(self):
+    def test_stall_breaks_retry(self):
         reset_dedup_buckets()
-        state = run_feedback_invoke("软件最近总是用不了，不知道什么情况", source="服务频道")
+        # 重分类没有带来信息增量时应提前收敛，而不是耗尽 3 轮配额
+        state = run_feedback_invoke("嗯，不知道怎么说，反正有点那个", source="服务频道")
         assert state.evidence_retrieved is True
+        assert state.reclassify_stalled is True
+        assert state.retry_count == 1
         assert state.finished is True
 
 

@@ -35,6 +35,7 @@ class FeedbackCategory(str, Enum):
     SUGGESTION = "作品建议"
     SENTIMENT = "舆情吐槽"
     AFTER_SALES = "售后报修"
+    POSITIVE = "正向反馈"
 
 class FeedbackSubCategory(str, Enum):
     FEATURE_REQUEST = "功能建议"
@@ -46,6 +47,8 @@ class FeedbackSubCategory(str, Enum):
     HARDWARE_FAULT = "硬件故障"
     SOFTWARE_BUG = "软件缺陷"
     LOGISTICS_ISSUE = "物流问题"
+    PRODUCT_PRAISE = "产品好评"
+    SERVICE_PRAISE = "服务好评"
 
 class ActionType(str, Enum):
     THOUGHT = "thought"
@@ -102,7 +105,13 @@ class CrawledFeedback(BaseModel):
 
 class FeedbackState(BaseModel):
     feedback_id: str = Field(default_factory=lambda: f"FB-{uuid.uuid4().hex[:8].upper()}")
-    raw_text: str = Field(default="")
+    raw_text: str = Field(default="", description="剥离 emoji 后的文本，链路统一口径")
+    original_text: str = Field(default="", description="用户原始文本，仅用于审计")
+    emoji_count: int = Field(default=0)
+    emoji_strong_negative: int = Field(default=0)
+    emoji_positive: int = Field(default=0)
+    emoji_ambiguous: int = Field(default=0, description="语境依赖型表情(😭😅[微笑])，不单独定性")
+    emoji_only: bool = Field(default=False, description="原文除表情外无有效内容")
     source: FeedbackSource = Field(default=FeedbackSource.COMMUNITY)
     product_line: XiaomiProductLine = Field(default=XiaomiProductLine.OTHER)
 
@@ -121,6 +130,9 @@ class FeedbackState(BaseModel):
     service_guide: Optional[ServiceGuide] = Field(default=None)
 
     trace: list[TraceStep] = Field(default_factory=list)
+    # 工具执行失败记录：既用于可观测的降级报告，也用于跳过失败步骤避免无限重试
+    errors: list[str] = Field(default_factory=list)
+    failed_tools: list[str] = Field(default_factory=list)
 
     summary: str = Field(default="")
     compressed_context: str = Field(default="")
@@ -131,7 +143,13 @@ class FeedbackState(BaseModel):
     next_tool: str = Field(default="")
     next_tool_args: str = Field(default="{}")
     loop_count: int = Field(default=0)
+    # LLM 决策的累计 token 消耗，用于离线评估单条成本
+    llm_prompt_tokens: int = Field(default=0)
+    llm_completion_tokens: int = Field(default=0)
+    # 带证据重分类没有带来改进时置位，避免在无信息增量的样本上空转
+    reclassify_stalled: bool = Field(default=False)
 
     use_deterministic: bool = Field(default=True)
+    fast_path: bool = Field(default=False, description="小模型高置信直通，未进入 LLM 决策循环")
     confidence_threshold: float = Field(default=0.7)
     dedup_threshold: float = Field(default=0.75)

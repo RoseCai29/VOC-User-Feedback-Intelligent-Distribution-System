@@ -5,7 +5,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+# 以项目根目录为基准，避免从其他工作目录启动时读不到 .env
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -20,6 +25,22 @@ class Settings(BaseSettings):
     max_loop_count: int = 20
     confidence_threshold: float = 0.7
     dedup_threshold: float = 0.75
+    # 分类通道: rules(纯规则) | semantic(纯LLM) | small(纯小模型) | cascade(小模型优先+LLM兜底)
+    # 默认 rules：真实 test 集实测 cascade L1 61.4% < rules 74.5%（小模型域偏移，见 README Known
+    # Limitations）。待真实标注重训 + 阈值重标定达标后再切回 cascade。
+    classifier_mode: str = "rules"
+    cascade_fallback: str = "llm"                     # 小模型低置信时的兜底: llm | rules
+    small_model_type: str = "bert"                    # bert | linear
+    small_model_path: str = "./data/models/bert_voc_v2"  # BERT 模型目录(真实标注重训版; 旧伪标签版为 bert_voc)
+    small_linear_model_path: str = "./data/models/small_clf.joblib"  # 线性模型基线
+    small_model_category_threshold: float = 0.80      # 一级直出阈值(真实 test 验证: 直出 L1 85.2%)
+    small_model_sub_threshold: float = 0.75           # 二级直出阈值(真实 test 验证: 直出 L2 75.3%)
+    # fast path（仅 LLM 模式触发）：真实 test 实测双阈值直出 L1 85.2% / L2 75.3%（覆盖 52.9%），
+    # 高于规则基线 74.5%/66.7%，经真实标注重训(bert_voc_v2)后开启；
+    # 旧伪标签模型同阈值仅 53.5%，历史教训见 README Known Limitations。
+    enable_fast_path: bool = True
+    enable_pending_pool: bool = True                  # 低置信样本写入待标注池
+    bootstrap_min_confidence: float = 0.8             # 伪标签进入训练集的最低LLM置信度
     # 生产护栏
     max_input_length: int = 2000          # 单条反馈最大字符数
     max_trace_steps: int = 60             # trace 轨迹有界上限
@@ -41,7 +62,7 @@ class Settings(BaseSettings):
     crawl_user_agent: str = "Mozilla/5.0 (VOC-Agent/1.0)"
     cors_origins: str = "*"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 _settings: Settings | None = None
