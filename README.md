@@ -11,6 +11,7 @@ An LLM agent system that classifies, deduplicates, and routes user feedback (VOC
 - **ReAct decision loop** — `agent_decision → tool_executor → agent_reflection`, the LLM picks the next tool each turn and decides when to converge (not a fixed pipeline).
 - **6 Function Calling tools** — `classify` (3-level classification + confidence), `retrieve_evidence` (ChromaDB semantic search), `dedup` (n-gram Jaccard), `route` (product-line × category lookup table), `push_service_guide`, `crawl_feedback`.
 - **Low-confidence self-correction** — confidence < 0.7 triggers evidence retrieval and re-classification, up to 3 rounds.
+- **Emoji-aware preprocessing** — emojis are stripped before classification while a weak-signal profile (strong-negative / positive / ambiguous counts) is kept in state; emoji-only text is passed through untouched for the LLM to judge. No forced sentiment polarity.
 - **Dual mode** — full LLM agent mode, or `USE_DETERMINISTIC=true` rule-engine mode that runs with **no API key** (same graph, deterministic tool cascade).
 - **Graceful degradation** — LLM failure falls back to the rule engine; ChromaDB unavailable falls back to Jaccard similarity.
 - **Production guards** — bounded trace length, input length limits, bounded dedup buckets, thread-safe dedup cache, structured logging.
@@ -22,6 +23,21 @@ An LLM agent system that classifies, deduplicates, and routes user feedback (VOC
 POST /feedback
       │
       ▼
+┌──────────────────────────────────────────────────────┐
+│  fast path (LLM mode only)                           │
+│  small model dual-threshold gate 0.80 / 0.75         │
+│  passes → whole pipeline runs deterministically,     │
+│           zero LLM calls                             │
+└──────────────┬───────────────────────────────────────┘
+               │ gate not met / rules mode
+               ▼
+┌──────────────────────────────────────────────────────┐
+│  preprocess   emoji strip + weak-signal profile      │
+│               (strong-negative / positive /          │
+│                ambiguous counts kept in state;       │
+│                emoji-only text kept verbatim)        │
+└──────────────┬───────────────────────────────────────┘
+               ▼
 ┌──────────────────────────────────────────────────────┐
 │  agent_decision   LLM reads state → picks 1 tool    │
 └──────────────┬───────────────────────────────────────┘
@@ -175,6 +191,7 @@ LangGraph · FastAPI · OpenAI Function Calling · ChromaDB · SQLAlchemy 2.0 ·
 - **ReAct 决策循环** —— `agent_decision → tool_executor → agent_reflection`，LLM 每轮自主选择下一个工具并决定何时收敛（非固定流水线）。
 - **6 个 Function Calling 工具** —— `classify`（三级分类+置信度）、`retrieve_evidence`（ChromaDB 语义检索）、`dedup`（n-gram Jaccard 去重）、`route`（产品线×分类倒排路由表）、`push_service_guide`（售后电话/链接推送）、`crawl_feedback`（异步爬虫骨架）。
 - **低置信自纠错** —— 置信度 < 0.7 自动检索历史证据并重分类，最多 3 轮。
+- **Emoji 感知预处理** —— 分类前剥离表情，仅保留弱信号三分组统计（强负/正/歧义计数）入状态；纯表情文本保留原文交给 LLM 判断，不强行判极性。
 - **双模式** —— 完整 LLM Agent 模式 / `USE_DETERMINISTIC=true` 确定性规则模式（**无需任何 API Key**，同一张图，规则引擎级联决策）。
 - **优雅降级** —— LLM 调用失败自动降级规则引擎；ChromaDB 不可用自动降级 Jaccard 相似度检索。
 - **工程护栏** —— trace 轨迹有界、输入长度上限、去重桶成员上限、去重缓存线程安全、结构化日志（含全量 traceback）。
@@ -186,6 +203,19 @@ LangGraph · FastAPI · OpenAI Function Calling · ChromaDB · SQLAlchemy 2.0 ·
 POST /feedback
       │
       ▼
+┌──────────────────────────────────────────────────────┐
+│  fast path（仅 LLM 模式）                             │
+│  小模型双阈值门禁 0.80 / 0.75                         │
+│  达标 → 整链路确定性直通，零 LLM 调用                 │
+└──────────────┬───────────────────────────────────────┘
+               │ 未达标 / 规则模式
+               ▼
+┌──────────────────────────────────────────────────────┐
+│  预处理     emoji 剥离 + 弱信号三分组统计             │
+│             （强负/正/歧义计数入状态；                │
+│               纯表情文本保留原文）                    │
+└──────────────┬───────────────────────────────────────┘
+               ▼
 ┌──────────────────────────────────────────────────────┐
 │  agent_decision   LLM 读取状态 → 选择 1 个工具      │
 └──────────────┬───────────────────────────────────────┘
