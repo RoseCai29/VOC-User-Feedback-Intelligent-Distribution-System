@@ -27,4 +27,13 @@ jobs:
         run: ruff check --select E9,F63,F7,F82 src scripts tests
 
       - name: Unit tests
-        run: pytest -q
+        # 失败时把关键错误行转成 annotations（公开仓库可匿名读取），便于离线定位根因
+        run: |
+          set +e
+          pytest -q --tb=short 2>&1 | tee pytest_out.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)|^E " pytest_out.txt | head -40 | awk '{print "::error title=pytest::" $0}'
+            tail -80 pytest_out.txt
+          fi
+          exit $code
