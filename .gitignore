@@ -13,7 +13,15 @@ logs/
 data/chroma/
 data/voc.db
 *.db
+# 训练产物(模型体积大，按需本地重新训练)
+data/models/
 
 # IDE
 .vscode/
 .idea/
+
+# 演示产物与个人材料（不进公开仓库）
+ppt/
+ppt_build/
+*.pptx
+面试提纲.md

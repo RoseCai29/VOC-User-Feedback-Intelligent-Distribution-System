@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SKIP_CHROMADB: "1"          # CI 无持久化向量库，直接降级 Jaccard 检索
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (fatal errors only)
+        # 只查语法错误/未定义名等致命问题；风格类告警尚未清零，暂不作为门禁
+        run: ruff check --select E9,F63,F7,F82 src scripts tests
+
+      - name: Unit tests
+        run: pytest -q
