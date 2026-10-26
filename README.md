@@ -9,11 +9,11 @@ An LLM agent system that classifies, deduplicates, and routes user feedback (VOC
 ## Highlights
 
 - **ReAct decision loop** — `agent_decision → tool_executor → agent_reflection`, the LLM picks the next tool each turn and decides when to converge (not a fixed pipeline).
-- **6 Function Calling tools** — `classify` (3-level classification + confidence), `retrieve_evidence` (ChromaDB semantic search), `dedup` (n-gram Jaccard), `route` (product-line × category lookup table), `push_service_guide`, `crawl_feedback`.
-- **Low-confidence self-correction** — confidence < 0.7 triggers evidence retrieval and re-classification, up to 3 rounds.
+- **6 Function Calling tools** — `classify` (3-level classification + confidence), `retrieve_evidence` (hybrid retrieval: BM25 lexical + ChromaDB vector, RRF fusion), `dedup` (n-gram Jaccard), `route` (product-line × category lookup table), `push_service_guide`, `crawl_feedback`.
+- **Low-confidence self-correction** — confidence < 0.7 triggers evidence retrieval and re-classification, up to 1 round (later rounds repeat the same evidence with no information gain).
 - **Emoji-aware preprocessing** — emojis are stripped before classification while a weak-signal profile (strong-negative / positive / ambiguous counts) is kept in state; emoji-only text is passed through untouched for the LLM to judge. No forced sentiment polarity.
 - **Dual mode** — full LLM agent mode, or `USE_DETERMINISTIC=true` rule-engine mode that runs with **no API key** (same graph, deterministic tool cascade).
-- **Graceful degradation** — LLM failure falls back to the rule engine; ChromaDB unavailable falls back to Jaccard similarity.
+- **Graceful degradation** — LLM failure falls back to the rule engine; ChromaDB unavailable degrades the hybrid retriever to BM25 + Jaccard (RRF-fused, still two rankings).
 - **Production guards** — bounded trace length, input length limits, bounded dedup buckets, thread-safe dedup cache, structured logging.
 - **FastAPI service** — `POST /feedback`, `GET /feedback/{id}`, `/health`, with SQLite persistence via SQLAlchemy 2.0.
 
@@ -50,7 +50,7 @@ POST /feedback
                ▼
 ┌──────────────────────────────────────────────────────┐
 │  agent_reflection confidence < 0.7 ?                 │
-│                   → re-classify with evidence (≤3轮) │
+│                   → re-classify with evidence (≤1轮) │
 │                   → else continue / FINISHED         │
 └──────────────┬───────────────────────────────────────┘
                │
@@ -91,19 +91,21 @@ Response includes `category / sub_category / confidence / tags / route_assignee 
 ## Tests & Evaluation
 
 ```bash
-python -m pytest tests/ -q          # 55 tests, no API key required
-
-# synthetic labeled eval set (22 examples)
-python -m src.evaluate --dataset data/eval_set.json --mode rules
-python -m src.evaluate --dataset data/eval_set.json --mode semantic
+python -m pytest tests/ -q          # 57 tests, no API key required
 
 # real App Store reviews (2171 raw, 269 human-labeled, dev 116 / test 153)
-python -m src.evaluate --dataset data/real/eval_real_dev.jsonl
-python -m src.evaluate --dataset data/real/eval_real_test.jsonl
+# default dataset = held-out real test set (153); the rules baseline gate (L1 >= 74%) runs inside pytest
+python -m src.evaluate --mode rules                 # == --dataset data/real/eval_real_test.jsonl
+python -m src.evaluate --mode semantic --dataset data/real/eval_real_dev.jsonl   # LLM experiments run on dev
 python -m scripts.eval_agent --dataset data/real/eval_real_test.jsonl --out data/real/agent_metrics_rules.json
+
+# synthetic set (22 examples) kept ONLY for the optimism-gap comparison — not an acceptance dataset
+python -m src.evaluate --dataset data/eval_set.json --mode rules
 ```
 
-The evaluator reports level-1 / level-2 accuracy, bootstrap 95% CI, macro F1, per-category precision-recall-F1, and a confusion matrix.
+The evaluator reports level-1 / level-2 accuracy, bootstrap 95% CI, macro F1 (acceptance metric — macro over micro because per-class health matters), micro F1 (equals accuracy in single-label multi-class), per-category precision-recall-F1, and a confusion matrix.
+
+The system evolved in three hops, each kept only when the numbers justified it: **(1) a keyword rule engine** — the origin, still the default baseline and the final fallback; **(2) LLM full-coverage classification** — semantic strength, but cost and instability; **(3) a distilled small model** — cold-started from LLM labels, then retrained on human labels, for cheap high-confidence direct output.
 
 Measured on 153 real test reviews (rules mode): level-1 **74.5%**, level-2 **66.7%**, macro F1 **0.73**
 (synthetic set: 86.4% / 77.3% / 0.86 — a 12pt gap that quantifies synthetic-data optimism).
@@ -124,11 +126,11 @@ Annotation flywheel (one full loop): low-confidence escalations land in the pend
 | `MODEL_NAME` | `gpt-4o-mini` | Chat model |
 | `USE_DETERMINISTIC` | `false` | `true` = rule engine, zero LLM calls |
 | `CONFIDENCE_THRESHOLD` | `0.7` | Low-confidence self-correction trigger |
-| `MAX_RETRIES` | `3` | Max evidence-retrieval re-classify rounds |
+| `MAX_RETRIES` | `1` | Max evidence-retrieval re-classify rounds |
 | `DEDUP_THRESHOLD` | `0.75` | Jaccard similarity threshold |
 | `DATABASE_URL` | `sqlite:///./data/voc.db` | Persistence |
 | `CHROMA_PERSIST_DIR` | `./data/chroma` | Vector store path |
-| `SKIP_CHROMADB` | — | `1` = skip ChromaDB, use Jaccard directly |
+| `SKIP_CHROMADB` | — | `1` = skip ChromaDB, hybrid degrades to BM25 + Jaccard |
 | `ENABLE_LIVE_CRAWL` | `false` | Live crawling switch |
 | `CLASSIFIER_MODE` | `rules` | `rules` \| `semantic` \| `small` \| `cascade` — retrained cascade (rules fallback) still measures 72.6% L1 vs rules 74.5%, so rules stays default |
 | `CASCADE_FALLBACK` | `llm` | Fallback engine when the small model is low-confidence in cascade mode |
@@ -149,7 +151,7 @@ src/
 ├── api.py        # FastAPI endpoints (event-loop-safe via asyncio.to_thread)
 ├── db.py         # SQLAlchemy 2.0 models: FeedbackRecord / DedupBucket / PendingLabel
 ├── evaluate.py   # accuracy / bootstrap CI / macro-F1 / confusion matrix
-├── classifier/   # small-model cascade: dataset, linear/bert, thresholds, bootstrap
+├── classifier/   # small-model cascade: dataset, bert, thresholds, bootstrap
 ├── preprocess.py # emoji / noise normalization
 ├── config.py     # pydantic-settings config center + production guards
 └── main.py       # CLI demo with 8 sample feedbacks
@@ -162,7 +164,7 @@ scripts/
 └── eval_agent.py           # end-to-end agent metrics (steps / degradation / tokens)
 data/eval_set.json    # 22 synthetic labeled examples
 data/real/            # real review corpus, human labels, dev/test eval sets, metrics
-tests/                # 55 tests: graph loop, tools, classifier, eval-set sanity
+tests/                # 57 tests: graph loop, tools, classifier, eval-set sanity
 ```
 
 ## Known Limitations
@@ -189,11 +191,11 @@ LangGraph · FastAPI · OpenAI Function Calling · ChromaDB · SQLAlchemy 2.0 ·
 ## 核心特性
 
 - **ReAct 决策循环** —— `agent_decision → tool_executor → agent_reflection`，LLM 每轮自主选择下一个工具并决定何时收敛（非固定流水线）。
-- **6 个 Function Calling 工具** —— `classify`（三级分类+置信度）、`retrieve_evidence`（ChromaDB 语义检索）、`dedup`（n-gram Jaccard 去重）、`route`（产品线×分类倒排路由表）、`push_service_guide`（售后电话/链接推送）、`crawl_feedback`（异步爬虫骨架）。
-- **低置信自纠错** —— 置信度 < 0.7 自动检索历史证据并重分类，最多 3 轮。
+- **6 个 Function Calling 工具** —— `classify`（三级分类+置信度）、`retrieve_evidence`（混合检索：BM25 词面 + ChromaDB 向量，RRF 融合）、`dedup`（n-gram Jaccard 去重）、`route`（产品线×分类倒排路由表）、`push_service_guide`（售后电话/链接推送）、`crawl_feedback`（异步爬虫骨架）。
+- **低置信自纠错** —— 置信度 < 0.7 自动检索历史证据并重分类，最多 1 轮（第 2 轮起证据同质、增量≈采样方差，故砍掉）。
 - **Emoji 感知预处理** —— 分类前剥离表情，仅保留弱信号三分组统计（强负/正/歧义计数）入状态；纯表情文本保留原文交给 LLM 判断，不强行判极性。
 - **双模式** —— 完整 LLM Agent 模式 / `USE_DETERMINISTIC=true` 确定性规则模式（**无需任何 API Key**，同一张图，规则引擎级联决策）。
-- **优雅降级** —— LLM 调用失败自动降级规则引擎；ChromaDB 不可用自动降级 Jaccard 相似度检索。
+- **优雅降级** —— LLM 调用失败自动降级规则引擎；ChromaDB 不可用时混合检索降级为 BM25 + Jaccard 双路 RRF 融合。
 - **工程护栏** —— trace 轨迹有界、输入长度上限、去重桶成员上限、去重缓存线程安全、结构化日志（含全量 traceback）。
 - **FastAPI 服务** —— `POST /feedback`、`GET /feedback/{id}`、`/health`，SQLAlchemy 2.0 + SQLite 持久化，`asyncio.to_thread` 避免阻塞事件循环。
 
@@ -228,7 +230,7 @@ POST /feedback
                ▼
 ┌──────────────────────────────────────────────────────┐
 │  agent_reflection 置信度 < 0.7 ?                     │
-│                   → 取证后重分类（≤3 轮）            │
+│                   → 取证后重分类（≤1 轮）            │
 │                   → 否则 continue / FINISHED         │
 └──────────────┬───────────────────────────────────────┘
                │
@@ -269,22 +271,24 @@ curl -X POST http://localhost:8000/feedback \
 ## 测试与评测
 
 ```bash
-python -m pytest tests/ -q          # 55 个测试，无需 API Key
-
-# 合成标注集（22 条，脚本生成）
-python -m src.evaluate --dataset data/eval_set.json --mode rules
-python -m src.evaluate --dataset data/eval_set.json --mode semantic
+python -m pytest tests/ -q          # 57 个测试，无需 API Key
 
 # 真实数据：App Store 中国区评论 2171 条原始 / 269 条人工标注（dev 116 / test 153）
-python -m src.evaluate --dataset data/real/eval_real_dev.jsonl
-python -m src.evaluate --dataset data/real/eval_real_test.jsonl
+# 默认数据集 = 留出真实 test 集（153 条）；规则基线守门（L1 >= 74%）由 pytest 执行
+python -m src.evaluate --mode rules                 # 等价于 --dataset data/real/eval_real_test.jsonl
+python -m src.evaluate --mode semantic --dataset data/real/eval_real_dev.jsonl   # LLM 实验在 dev 上做
 python -m scripts.eval_agent --dataset data/real/eval_real_test.jsonl --out data/real/agent_metrics_rules.json
+
+# 合成标注集（22 条，脚本生成）——仅用于量化合成乐观偏差的对比实验，不作验收口径
+python -m src.evaluate --dataset data/eval_set.json --mode rules
 
 # 真实评论端到端入库（幂等：同一 source+review_id 不新增记录）
 python -m scripts.ingest_real_reviews --limit 200
 ```
 
-评测输出 level-1 / level-2 准确率、bootstrap 95% 置信区间、宏观 F1、各类别精确率-召回率-F1、混淆矩阵。
+评测输出 level-1 / level-2 准确率、bootstrap 95% 置信区间、宏观 F1（验收指标）、微 F1（单标签多分类下恒等于准确率，仅作口径对照）、各类别精确率-召回率-F1、混淆矩阵。
+
+系统按三级演进落地，每一步都由数字决定去留：**① 关键词规则引擎起步**——项目的起点，至今仍是默认基线与最终兜底；**② 引入大模型全量分类**——语义能力强，但贵且不稳定；**③ 蒸馏小模型降本**——大模型冷启动伪标签 + 人工标注回流重训，高置信直出。
 
 真实 test 153 条（规则模式）：一级 **74.5%**、二级 **66.7%**、宏观 F1 **0.73**；
 合成集 86.4% / 77.3% / 0.86 —— 约 12 个点的落差量化了合成数据的乐观偏差。
@@ -305,11 +309,11 @@ CI 由 GitHub Actions 在每次 push/PR 触发（`.github/workflows/ci.yml`）�
 | `MODEL_NAME` | `gpt-4o-mini` | 对话模型 |
 | `USE_DETERMINISTIC` | `false` | `true` = 规则引擎，零 LLM 调用 |
 | `CONFIDENCE_THRESHOLD` | `0.7` | 低置信自纠错触发阈值 |
-| `MAX_RETRIES` | `3` | 取证重分类最大轮数 |
+| `MAX_RETRIES` | `1` | 取证重分类最大轮数 |
 | `DEDUP_THRESHOLD` | `0.75` | Jaccard 相似度阈值 |
 | `DATABASE_URL` | `sqlite:///./data/voc.db` | 持久化 |
 | `CHROMA_PERSIST_DIR` | `./data/chroma` | 向量库路径 |
-| `SKIP_CHROMADB` | — | `1` = 跳过 ChromaDB，直接 Jaccard |
+| `SKIP_CHROMADB` | — | `1` = 跳过 ChromaDB，混合检索降级 BM25 + Jaccard |
 | `ENABLE_LIVE_CRAWL` | `false` | 真实爬取开关 |
 | `CLASSIFIER_MODE` | `rules` | `rules` \| `semantic` \| `small` \| `cascade` —— 重训后级联(规则兜底)实测 72.6% L1 仍低于规则 74.5%，默认保持 rules |
 | `CASCADE_FALLBACK` | `llm` | 级联模式下小模型低置信时的兜底引擎 |
@@ -330,7 +334,7 @@ src/
 ├── api.py        # FastAPI 端点（asyncio.to_thread 防阻塞）
 ├── db.py         # SQLAlchemy 2.0 模型: FeedbackRecord / DedupBucket / PendingLabel
 ├── evaluate.py   # 准确率 / bootstrap 置信区间 / 宏观 F1 / 混淆矩阵
-├── classifier/   # 小模型级联: 数据集、linear/bert、阈值标定、bootstrap
+├── classifier/   # 小模型级联: 数据集、bert、阈值标定、bootstrap
 ├── preprocess.py # emoji / 噪声归一化
 ├── config.py     # pydantic-settings 配置中心 + 生产护栏
 └── main.py       # CLI 演示，8 条样例反馈
@@ -343,7 +347,7 @@ scripts/
 └── eval_agent.py           # Agent 端到端指标（步数/降级/token 成本）
 data/eval_set.json    # 22 条合成标注样例
 data/real/            # 真实评论语料、人工标注、dev/test 评测集与指标
-tests/                # 55 个测试: 图循环、工具、分类器、评测集校验
+tests/                # 57 个测试: 图循环、工具、分类器、评测集校验
 ```
 
 ## 已知边界与短板
