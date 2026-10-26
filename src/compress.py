@@ -95,11 +95,4 @@ def build_compressed_context(state: FeedbackState, max_trace_steps: int = 5) -> 
         f"## {trace_str}"
     )
 
-    state.compressed_context = context
-    state.summary = summary
     return context
-
-
-def estimate_tokens(text: str) -> int:
-    """粗略估算 token 数 (中文 ~1.5 char/token, 英文 ~4 char/token)"""
-    return len(text) // 3

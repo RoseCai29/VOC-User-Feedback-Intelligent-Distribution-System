@@ -8,7 +8,7 @@ LangGraph 状态机 —— LLM 作为唯一决策中枢
                                       END <------------+
 
 LLM 通过 OpenAI Function Calling 绑定 6 个工具，每轮自主决定调用哪个、何时收敛。
-低置信自纠错: confidence<0.7 -> LLM自主调用 retrieve_evidence -> re-classify (最多3轮)
+低置信自纠错: confidence<0.7 -> LLM自主调用 retrieve_evidence -> re-classify (最多1轮)
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from .state import FeedbackCategory, FeedbackSubCategory, FeedbackSource
 from .state import XiaomiProductLine, CrawledFeedback
 # 工具层：工具 Schema 定义、工具执行器、语义分类
 from .tools import TOOL_SCHEMAS, execute_tool, classify_auto, small_model_predict
+from .classifier.router import double_threshold_pass
 from .preprocess import analyze_emoji
 # 上下文压缩：将长历史摘要为 LLM 可接受的 prompt 长度
 from .compress import build_compressed_context
@@ -49,17 +50,17 @@ _SYSTEM_PROMPT = """你是 VOC 用户反馈智能分发中枢。每轮你有权�
 | route | 产品线x分类倒排路由 | 去重完成后 |
 | push_service_guide | 推送售后电话/链接 | 分类为"售后报修"时 |
 
-## 低置信自纠错流程 (最多3轮)
+## 低置信自纠错流程 (最多1轮)
 1. classify 返回 confidence < 0.7
 2. 先判断: 是否有相关历史工单可检索?
 3. 若可行 -> 调用 retrieve_evidence(query=反馈原文)
 4. 拿到证据后 -> 重新 classify(raw_text=原文, evidence_context=证据摘要)
-5. 若置信度仍<0.7且未满3轮 -> 继续; 满3轮 -> 以最终结果收敛
+5. 若置信度仍<0.7且尚未带证据重分类 -> 进行1轮重分类; 已满1轮 -> 以最终结果收敛
 
 ## 收敛条件
 - 分类非售后 + 去重完成 + 路由完成 -> FINISHED
 - 分类为售后 + 去重 + 路由 + 售后电话/链接推送完成 -> FINISHED
-- 置信度低但已满3轮重试 -> FINISHED
+- 置信度低但已满1轮重试 -> FINISHED
 
 ## 当前状态上下文
 {context}
@@ -175,7 +176,7 @@ def _deterministic_agent(state: FeedbackState) -> dict:
     if (cls.confidence < state.confidence_threshold and not state.evidence_retrieved
             and retry < state.max_retries and "retrieve_evidence" not in state.failed_tools):
         return {"thought": f"降级: 置信度{cls.confidence}<{state.confidence_threshold}，检索证据({retry+1}/{state.max_retries})",
-                "tool_name": "retrieve_evidence", "tool_args": {"query": raw, "top_k": 3}}
+                "tool_name": "retrieve_evidence", "tool_args": {"query": raw, "top_k": get_settings().evidence_top_k}}
     # 步骤4：置信度不足 + 已有证据 + 有重试配额 + 重分类仍有信息增量 → 带证据重分类
     if (cls.confidence < state.confidence_threshold and state.evidence_retrieved
             and retry < state.max_retries and not state.reclassify_stalled):
@@ -230,10 +231,44 @@ def _bounded_trace(state: FeedbackState, step: TraceStep) -> list[TraceStep]:
     return (list(state.trace) + [step])[-cfg.max_trace_steps:]
 
 
+# ── 工具结果 → 状态字段映射：tool_executor 与 fast path 共用，字段变更只改一处 ──
+
+def _apply_dedup(result: dict, state: FeedbackState) -> dict:
+    """去重结果映射：is_duplicate + dedup_bucket。"""
+    is_dup = bool(result.get("is_duplicate", False))
+    return {
+        "is_duplicate": is_dup,
+        "dedup_bucket": DedupBucket(
+            bucket_id=result.get("bucket_id", ""),
+            representative=result.get("representative", state.raw_text),
+            count=result.get("bucket_count", 1),
+            members=result.get("members", []) if is_dup else [],
+        ),
+    }
+
+
+def _apply_route(result: dict) -> RouteTarget:
+    """路由结果映射：责任组 + SLA。"""
+    return RouteTarget(
+        product_line=result.get("product_line", ""), sub_line=result.get("sub_line", ""),
+        assignee=result.get("assignee", ""), sla_hours=result.get("sla_hours", 48),
+    )
+
+
+def _apply_guide(result: dict) -> ServiceGuide | None:
+    """售后指南结果映射；工具未返回 guide 时返回 None 表示不更新状态。"""
+    gd = result.get("guide", {})
+    if not gd:
+        return None
+    return ServiceGuide(phone=gd.get("phone", ""), link=gd.get("link", ""),
+                        message=gd.get("message", ""))
+
+
 def agent_decision_node(state: FeedbackState) -> dict:
     """Agent 决策节点：LangGraph 的入口，由 LLM 决定下一工具或终止。
 
     流程：
+    0. 首步直调：无分类结果时下一步必然是「分类」，不消耗 LLM 调用
     1. 构建压缩上下文（将 trace 历史 + 状态摘要压缩为 prompt）
     2. 若未禁用 LLM，调用 _call_llm 获取决策；失败则降级到规则引擎
     3. 完整性护栏：若 LLM 返回 FINISHED 但必需步骤未完成，强制用规则引擎接管
@@ -247,14 +282,26 @@ def agent_decision_node(state: FeedbackState) -> dict:
     """
     ctx = build_compressed_context(state)
     decision: dict | None = None
+    # 首步确定性直调：首次决策时（无分类结果、分类未失败过）下一步必然且仅能是
+    # 「分类」，与确定性编排 step1-2 一致——这类可确定决策不消耗 LLM 调用；
+    # 后续的取证/重分类/收敛判断仍交由 LLM 决策，保留 Agent 循环语义。
+    if state.loop_count == 0 and state.classification is None and "classify" not in state.failed_tools:
+        if state.raw_text:
+            src = state.source.value if hasattr(state.source, 'value') else str(state.source)
+            decision = {"thought": "首步直调: 分类(免LLM决策)",
+                        "tool_name": "classify",
+                        "tool_args": {"raw_text": state.raw_text, "source": src}}
+        else:
+            decision = _deterministic_agent(state)
     # 决策预算护栏：LLM 反复在分类/取证之间打转时，剩余步数交给确定性编排收尾，
     # 否则到达循环上限会被直接截断，去重/路由永远补不上，链路判为失败。
-    budget_left = state.max_retries * 2 + 3
-    if state.loop_count >= budget_left:
+    # 预算 = 硬上限留 5 步收尾余量（收尾需 去重/路由/售后/完成 至多 4 步 + 缓冲）
+    budget_left = _loop_hard_limit(state) - 5
+    if decision is None and state.loop_count >= budget_left:
         logger.info("Agent 决策预算用尽(loop=%d)，切换到确定性编排收尾", state.loop_count)
         decision = _deterministic_agent(state)
     # 若启用 LLM 模式且仍有预算，优先使用 LLM 决策
-    elif not state.use_deterministic:
+    elif decision is None and not state.use_deterministic:
         try:
             decision = _call_llm(_SYSTEM_PROMPT.format(context=ctx), TOOL_SCHEMAS)
         except Exception as e:
@@ -271,8 +318,7 @@ def agent_decision_node(state: FeedbackState) -> dict:
     ta = decision.get("tool_args", {})
     step = TraceStep(thought=decision.get("thought", ""), action=f"decision -> {tn}", action_type=ActionType.THOUGHT)
     result = {"next_tool": tn, "next_tool_args": json.dumps(ta, ensure_ascii=False),
-              "loop_count": state.loop_count + 1, "trace": _bounded_trace(state, step),
-              "compressed_context": ctx}
+              "loop_count": state.loop_count + 1, "trace": _bounded_trace(state, step)}
     if tn == "FINISHED":
         result["finished"] = True
     # 累计 LLM 决策的 token 消耗
@@ -393,26 +439,23 @@ def tool_executor_node(state: FeedbackState) -> dict:
         updates["evidence_retrieved"] = True
     # ---- dedup：n-gram Jaccard 去重 ----
     elif tn == "dedup":
-        is_dup = result.get("is_duplicate", False)
-        updates["is_duplicate"] = is_dup
-        updates["dedup_bucket"] = DedupBucket(bucket_id=result.get("bucket_id", ""), representative=result.get("representative", state.raw_text), count=result.get("bucket_count", 1), members=result.get("members", []) if is_dup else [])
+        updates.update(_apply_dedup(result, state))
     # ---- route：按产品线 × 分类匹配处理人和 SLA ----
     elif tn == "route":
-        updates["route_target"] = RouteTarget(product_line=result.get("product_line", ""), sub_line=result.get("sub_line", ""), assignee=result.get("assignee", ""), sla_hours=result.get("sla_hours", 48))
+        updates["route_target"] = _apply_route(result)
     # ---- push_service_guide：推送售后电话/自助链接 ----
     elif tn == "push_service_guide":
-        gd = result.get("guide", {})
-        if gd:
-            updates["service_guide"] = ServiceGuide(phone=gd.get("phone", ""), link=gd.get("link", ""), message=gd.get("message", ""))
+        guide = _apply_guide(result)
+        if guide is not None:
+            updates["service_guide"] = guide
     # ---- crawl_feedback：爬取反馈，解析产品线和来源 ----
     elif tn == "crawl_feedback":
         items = result.get("items", [])
-        src_m = {"社区": FeedbackSource.COMMUNITY, "商城": FeedbackSource.MALL, "服务频道": FeedbackSource.SERVICE}
         crawled = []
         for item in items:
             lv = item.get("product_line", "其他")
             le = next((l for l in XiaomiProductLine if l.value == lv), XiaomiProductLine.OTHER)
-            crawled.append(CrawledFeedback(raw_text=item.get("raw_text", ""), source=src_m.get(item.get("source", "社区"), FeedbackSource.COMMUNITY), product_line=le, url=item.get("url", ""), metadata={"batch": state.feedback_id}))
+            crawled.append(CrawledFeedback(raw_text=item.get("raw_text", ""), source=_SRC_MAP.get(item.get("source", "社区"), FeedbackSource.COMMUNITY), product_line=le, url=item.get("url", ""), metadata={"batch": state.feedback_id}))
         updates["crawled_feedbacks"] = crawled
         updates["crawl_completed"] = True
         if crawled:
@@ -429,7 +472,7 @@ def reflection_node(state: FeedbackState) -> dict:
 
     这是 LangGraph 状态机的核心路由节点，按优先级依次判断：
     1. LLM 已发出 FINISHED 信号 → 正常终止
-    2. 循环次数超过上限(max_retries*2+5) → 强制收敛，防止死循环
+    2. 循环次数超过硬上限(_loop_hard_limit) → 强制收敛，防止死循环
     3. 分类置信度不足但有证据支撑且未达重试上限 → 触发低置信自纠错，重新分类
     4. 以上均不满足 → 继续下一轮 Agent 决策循环
 
@@ -545,10 +588,9 @@ def _try_fast_path(raw_text: str, source: str, product_line: XiaomiProductLine) 
         return None
     text = profile.text
     pred = small_model_predict(text)
-    if pred is None:
-        return None
-    if (pred.category_confidence < cfg.small_model_category_threshold
-            or pred.sub_confidence < cfg.small_model_sub_threshold):
+    # 双阈值判定与 CascadeRouter 共用同一实现，避免两处口径漂移
+    if not double_threshold_pass(pred, cfg.small_model_category_threshold,
+                                 cfg.small_model_sub_threshold):
         return None
 
     cat = next((c for c in FeedbackCategory if c.value == pred.category), None)
@@ -597,20 +639,15 @@ def _try_fast_path(raw_text: str, source: str, product_line: XiaomiProductLine) 
     d = _run("dedup", {"text": text, "threshold": cfg.dedup_threshold})
     if d is None:
         return None
-    state.is_duplicate = bool(d.get("is_duplicate", False))
-    state.dedup_bucket = DedupBucket(
-        bucket_id=d.get("bucket_id", ""), representative=text,
-        count=d.get("bucket_count", 1), members=[],
-    )
+    dedup_updates = _apply_dedup(d, state)
+    state.is_duplicate = dedup_updates["is_duplicate"]
+    state.dedup_bucket = dedup_updates["dedup_bucket"]
 
     r = _run("route", {"category": cat.value, "sub_category": sub.value,
                        "source": source, "product_line": product_line.value})
     if r is None:
         return None
-    state.route_target = RouteTarget(
-        product_line=r.get("product_line", ""), sub_line=r.get("sub_line", ""),
-        assignee=r.get("assignee", ""), sla_hours=r.get("sla_hours", 48),
-    )
+    state.route_target = _apply_route(r)
 
     if cat == FeedbackCategory.AFTER_SALES:
         g = _run("push_service_guide", {
@@ -618,11 +655,9 @@ def _try_fast_path(raw_text: str, source: str, product_line: XiaomiProductLine) 
         })
         if g is None:
             return None
-        guide = g.get("guide", {})
-        state.service_guide = ServiceGuide(
-            phone=guide.get("phone", ""), link=guide.get("link", ""),
-            message=guide.get("message", ""),
-        )
+        guide = _apply_guide(g)
+        if guide is not None:
+            state.service_guide = guide
 
     state.finished = True
     state.next_tool = "FINISHED"

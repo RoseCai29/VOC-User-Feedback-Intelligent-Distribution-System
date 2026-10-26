@@ -39,6 +39,25 @@ class TestRetrieveEvidence:
         assert len(r["evidence"]) >= 1
         assert "ticket_id" in r["evidence"][0]
 
+    def test_hybrid_engine(self):
+        # 混合检索: 无论 ChromaDB 是否可用，engine 都是双路 RRF 融合口径
+        r = json.loads(retrieve_evidence("闪退崩溃保修"))
+        assert r["engine"] in ("hybrid_vector_bm25", "hybrid_bm25_jaccard")
+        assert r["total_candidates"] >= len(r["evidence"])
+
+    def test_bm25_exact_term_ranks_first(self):
+        # BM25 抓精确词面: 「小米14 Ultra」应命中对应工单
+        from src.tools import _bm25_rank, _HISTORICAL_TICKETS
+        scores = _bm25_rank("小米14 Ultra夜景偏黄", _HISTORICAL_TICKETS)
+        assert max(scores, key=lambda k: scores[k]) == "T011"
+
+    def test_rrf_fuse(self):
+        from src.tools import _rrf_fuse
+        # 两路各第1/第2: 被双路都靠前命中的 b 应排最前(1/61+1/62 > 1/61)
+        fused = _rrf_fuse([["a", "b"], ["b", "c"]])
+        assert fused[0] == "b"
+        assert set(fused) == {"a", "b", "c"}
+
 
 class TestDedup:
     def test_new_feedback(self):

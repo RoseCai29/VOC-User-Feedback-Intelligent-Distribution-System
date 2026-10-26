@@ -62,7 +62,7 @@ class TestBertSmallModel:
         assert abs(after.category_confidence - before.category_confidence) < 1e-4
         assert json.loads((tmp_path / "bert" / "config.json").read_text(encoding="utf-8"))["max_len"] == 32
 
-    def test_config_dispatches_to_bert(self, tiny_backbone, tmp_path, monkeypatch):
+    def test_loads_bert_from_config_path(self, tiny_backbone, tmp_path, monkeypatch):
         from src import tools
         from src.classifier.bert import BertSmallModel
         from src.config import get_settings
@@ -70,7 +70,6 @@ class TestBertSmallModel:
         model = _build_model(tiny_backbone)
         model.save(tmp_path / "bert")
         cfg = get_settings()
-        monkeypatch.setattr(cfg, "small_model_type", "bert")
         monkeypatch.setattr(cfg, "small_model_path", str(tmp_path / "bert"))
         monkeypatch.setattr(tools, "_small_model", None)
         monkeypatch.setattr(tools, "_small_model_failed", False)

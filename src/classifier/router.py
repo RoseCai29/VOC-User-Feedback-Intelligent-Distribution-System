@@ -17,12 +17,26 @@ logger = logging.getLogger(__name__)
 FallbackFn = Callable[[str, str, str], str]
 
 
+def double_threshold_pass(
+    pred: SmallModelPrediction | None,
+    category_threshold: float,
+    sub_threshold: float,
+) -> bool:
+    """双阈值判定：一级、二级置信度都达标才允许小模型直出。
+
+    fast path 与 CascadeRouter 共用此判定，避免阈值逻辑两处维护出现口径漂移。
+    """
+    return (pred is not None
+            and pred.category_confidence >= category_threshold
+            and pred.sub_confidence >= sub_threshold)
+
+
 class CascadeRouter:
     def __init__(
         self,
         model: SmallModel | None,
-        category_threshold: float = 0.85,
-        sub_threshold: float = 0.70,
+        category_threshold: float = 0.80,
+        sub_threshold: float = 0.75,
         fallback: FallbackFn | None = None,
     ):
         self.model = model
@@ -32,10 +46,8 @@ class CascadeRouter:
 
     def classify(self, raw_text: str, source: str = "社区", evidence_context: str = "") -> str:
         pred = self.model.predict(raw_text) if self.model is not None else None
-        # 两级置信度都达标才允许小模型直出
-        if (pred is not None
-                and pred.category_confidence >= self.category_threshold
-                and pred.sub_confidence >= self.sub_threshold):
+        # 两级置信度都达标才允许小模型直出（与 fast path 共用同一判定）
+        if double_threshold_pass(pred, self.category_threshold, self.sub_threshold):
             return self._small_result(pred)
 
         if self.fallback is None:

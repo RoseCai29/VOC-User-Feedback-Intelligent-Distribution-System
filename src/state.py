@@ -134,10 +134,7 @@ class FeedbackState(BaseModel):
     errors: list[str] = Field(default_factory=list)
     failed_tools: list[str] = Field(default_factory=list)
 
-    summary: str = Field(default="")
-    compressed_context: str = Field(default="")
-
-    max_retries: int = Field(default=3)
+    max_retries: int = Field(default=1)
     retry_count: int = Field(default=0)
     finished: bool = Field(default=False)
     next_tool: str = Field(default="")

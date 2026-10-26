@@ -17,7 +17,10 @@ from pathlib import Path
 
 from .tools import classify, classify_semantic, classify_auto
 
+# 合成集（历史遗留，仅可显式 --dataset 传入做对比；实测比真实口径高估约 12 个点）
 EVAL_SET_PATH = Path(__file__).resolve().parent.parent / "data" / "eval_set.json"
+# 验收默认口径：真实人工标注 test 集
+REAL_EVAL_SET_PATH = Path(__file__).resolve().parent.parent / "data" / "real" / "eval_real_test.jsonl"
 
 
 def load_eval_set(path: Path | str = EVAL_SET_PATH) -> list[dict]:
@@ -52,17 +55,14 @@ def label_cascade(text: str, source: str = "社区") -> dict:
 
 
 def _normalize(label_fn, text: str, source: str) -> tuple[str, str, str, bool]:
-    """兼容两种标注函数：返回 dict(含 engine) 或 (category, sub_category) 元组。"""
+    """调用标注函数并归一化为 (category, sub_category, engine, escalated)。"""
     out = label_fn(text, source)
-    if isinstance(out, dict):
-        return (
-            out.get("category", ""),
-            out.get("sub_category", ""),
-            out.get("engine", "unknown"),
-            bool(out.get("escalated", False)),
-        )
-    pred_c, pred_s = out
-    return pred_c, pred_s, "unknown", False
+    return (
+        out.get("category", ""),
+        out.get("sub_category", ""),
+        out.get("engine", "unknown"),
+        bool(out.get("escalated", False)),
+    )
 
 
 def _bootstrap_ci(flags: list[int], n_boot: int = 1000, seed: int = 42) -> list[float]:
@@ -130,6 +130,13 @@ def evaluate(label_fn, examples: list[dict]) -> dict:
         f1 = 2 * p * r / (p + r) if (p + r) else 0.0
         per[c] = {"precision": round(p, 3), "recall": round(r, 3), "f1": round(f1, 3)}
     macro_f1 = sum(m["f1"] for m in per.values()) / len(per) if per else 0.0
+    # 微 F1：全局汇总 TP/FP/FN 再算 F1。单标签多分类下恒等于准确率，
+    # 报出仅为口径完整（与宏 F1 对照，说明为何验收看宏 F1：防小类塌方被平均掩盖）
+    tp_all = sum(conf[c][c] for c in cats)  # 各类 TP 之和 == 预测正确的总数
+    fp_all = fn_all = n - tp_all
+    micro_p = tp_all / (tp_all + fp_all) if (tp_all + fp_all) else 0.0
+    micro_r = tp_all / (tp_all + fn_all) if (tp_all + fn_all) else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
 
     return {
         "total": n,
@@ -138,6 +145,7 @@ def evaluate(label_fn, examples: list[dict]) -> dict:
         "level1_accuracy_ci95": _bootstrap_ci(l1_flags),
         "level2_accuracy_ci95": _bootstrap_ci(l2_flags),
         "macro_f1": round(macro_f1, 4),
+        "micro_f1": round(micro_f1, 4),
         "per_category": per,
         "confusion": {k: dict(v) for k, v in conf.items()},
         "coverage": round(covered / n, 4) if n else 0.0,
@@ -153,8 +161,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="VOC 分类器评估")
     ap.add_argument("--mode", choices=["rules", "semantic", "cascade"], default="rules",
                     help="rules=关键词规则 / semantic=LLM / cascade=小模型优先+LLM兜底")
-    ap.add_argument("--dataset", type=str, default=None,
-                    help="指定数据集文件(JSONL/JSON/CSV/TSV)，默认 data/eval_set.json")
+    ap.add_argument("--dataset", type=str, default=str(REAL_EVAL_SET_PATH),
+                    help="数据集路径(JSONL/JSON/CSV/TSV)，默认 data/real/eval_real_test.jsonl"
+                         "（真实人工标注 test 集；合成集 eval_set.json 已退出默认口径，仅显式传入做对比）")
     ap.add_argument("--cascade-fallback", choices=["llm", "rules"], default=None,
                     help="级联低置信兜底通道，默认读配置")
     ap.add_argument("--text-field", default=None, help="文本列名(默认自动识别)")
@@ -175,7 +184,7 @@ def main() -> None:
     examples = load_dataset(
         args.dataset, args.text_field, args.category_field,
         args.sub_category_field, args.source_field,
-    ) if args.dataset else load_eval_set()
+    )
     fn = {"rules": label_rules, "semantic": label_semantic, "cascade": label_cascade}[args.mode]
     print(json.dumps(evaluate(fn, examples), ensure_ascii=False, indent=2))
 

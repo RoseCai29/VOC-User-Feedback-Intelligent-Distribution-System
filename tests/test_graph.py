@@ -36,7 +36,7 @@ class TestLowConfidenceLoop:
 
     def test_stall_breaks_retry(self):
         reset_dedup_buckets()
-        # 重分类没有带来信息增量时应提前收敛，而不是耗尽 3 轮配额
+        # 重分类没有带来信息增量时应提前收敛，而不是耗尽重试配额
         state = run_feedback_invoke("嗯，不知道怎么说，反正有点那个", source="服务频道")
         assert state.evidence_retrieved is True
         assert state.reclassify_stalled is True

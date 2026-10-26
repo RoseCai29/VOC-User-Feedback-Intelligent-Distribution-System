@@ -5,47 +5,8 @@ import json
 import pytest
 
 from src.classifier.base import SmallModelPrediction
-from src.classifier.linear import LinearSmallModel
 from src.classifier.router import CascadeRouter
 from src.evaluate import evaluate
-
-
-_SEEDS = {
-    ("作品建议", "功能建议"): "希望增加新功能",
-    ("作品建议", "界面优化"): "界面布局不好看",
-    ("作品建议", "内容推荐"): "推荐算法不准确",
-    ("舆情吐槽", "产品质量"): "产品质量太差了",
-    ("舆情吐槽", "服务态度"): "客服态度很差",
-    ("舆情吐槽", "价格问题"): "价格太贵了",
-    ("售后报修", "硬件故障"): "手机无法开机",
-    ("售后报修", "软件缺陷"): "APP闪退崩溃",
-    ("售后报修", "物流问题"): "物流太慢还没发货",
-}
-
-
-def _build_samples(n_per: int = 12):
-    texts, cats, subs = [], [], []
-    for (cat, sub), seed in _SEEDS.items():
-        for i in range(n_per):
-            texts.append(f"{seed}，第{i}条反馈")
-            cats.append(cat)
-            subs.append(sub)
-    return texts, cats, subs
-
-
-def test_linear_small_model_train_save_load(tmp_path):
-    texts, cats, subs = _build_samples()
-    model = LinearSmallModel.train(texts, cats, subs)
-    path = tmp_path / "small.joblib"
-    model.save(path)
-
-    loaded = LinearSmallModel.load(path)
-    pred = loaded.predict("APP老是闪退崩溃，根本用不了")
-    assert pred is not None
-    assert pred.category == "售后报修"
-    assert pred.sub_category == "软件缺陷"
-    assert 0.0 <= pred.category_confidence <= 1.0
-    assert 0.0 <= pred.sub_confidence <= 1.0
 
 
 class _FakeModel:

@@ -3,17 +3,19 @@ VOC 智能分发系统 —— 6 个 Function Calling 工具
 全注册为 OpenAI-compatible tool schema，LLM 自主决定调用次序。
 
 含金量躍升点:
-  retrieve_evidence → ChromaDB 向量语义检索 (非玩具 Jaccard)
+  retrieve_evidence → 混合检索: BM25词面 + ChromaDB向量语义, RRF融合 (降级 BM25+Jaccard)
   crawl_feedback     → httpx 异步爬虫骨架 (非硬编码 mock)
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import hashlib
 import logging
 import threading
+from collections import Counter
 
 from .state import (
     ClassificationResult,
@@ -143,7 +145,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "retrieve_evidence",
-            "description": "ChromaDB向量语义检索历史工单。classify置信度<0.7时LLM先判断可行性再调用此工具，结果写入evidence_ids后自主重分类。",
+            "description": "混合检索历史工单(BM25词面+向量语义RRF融合，ChromaDB不可用时降级BM25+Jaccard)。classify置信度<0.7时LLM先判断可行性再调用此工具，结果写入evidence_ids后自主重分类。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -549,13 +551,9 @@ def _get_small_model():
             return _small_model
         cfg = get_settings()
         try:
-            if (cfg.small_model_type or "linear").lower() == "bert":
-                from .classifier.bert import BertSmallModel
-                _small_model = BertSmallModel.load(cfg.small_model_path)
-            else:
-                from .classifier.linear import LinearSmallModel
-                _small_model = LinearSmallModel.load(cfg.small_linear_model_path)
-            logger.info("小模型加载成功: type=%s path=%s", cfg.small_model_type, cfg.small_model_path)
+            from .classifier.bert import BertSmallModel
+            _small_model = BertSmallModel.load(cfg.small_model_path)
+            logger.info("小模型加载成功: path=%s", cfg.small_model_path)
         except Exception as e:
             _small_model_failed = True
             logger.warning("小模型不可用，降级大模型/规则: %s", e)
@@ -605,10 +603,9 @@ def _capture_pending(result_json: str, raw_text: str, source: str) -> None:
 def classify_auto(raw_text: str, source: str = "社区", evidence_context: str = "") -> str:
     """按配置选择分类通道。
 
-    rules    -> 关键词规则
+    rules    -> 关键词规则(config 默认)
     semantic -> LLM 语义分类(失败内部降级规则)
-    small    -> 纯小模型(无预测则降级规则)
-    cascade  -> 小模型高置信直出，低置信升级 LLM/规则(默认)
+    cascade  -> 小模型高置信直出，低置信升级 LLM/规则
     """
     cfg = get_settings()
     mode = (cfg.classifier_mode or "cascade").lower()
@@ -623,12 +620,6 @@ def classify_auto(raw_text: str, source: str = "社区", evidence_context: str =
     from .classifier.router import CascadeRouter
 
     model = _get_small_model()
-    if mode == "small":
-        # 阈值归零：只要有预测就用小模型，无预测时 fallback 到规则
-        return CascadeRouter(model, 0.0, 0.0, fallback=classify).classify(
-            text, source, evidence_context,
-        )
-
     fallback = classify if (cfg.cascade_fallback or "llm").lower() == "rules" else classify_semantic
     result = CascadeRouter(
         model,
@@ -641,34 +632,122 @@ def classify_auto(raw_text: str, source: str = "社区", evidence_context: str =
     return result
 
 
-# retrieve_evidence (ChromaDB + Jaccard 降级)
+# retrieve_evidence (混合检索: BM25 + 语义/词面近邻, RRF 融合)
 
 # ═══════════════════════════════════════════
 
+def _bigrams(text: str) -> list[str]:
+    """char bigram 词项序列（保留词频，供 BM25 计数；中文免分词）。"""
+    text = text.replace(" ", "")
+    if len(text) < 2:
+        return [text] if text else []
+    return [text[i:i + 2] for i in range(len(text) - 1)]
+
+
+def _bm25_rank(query: str, tickets: list[dict]) -> dict[str, float]:
+    """Okapi BM25 (k1=1.5, b=0.75)，词项 = char bigram。
+
+    与向量检索互补：向量抓语义改写，BM25 抓型号/版本号等精确词面。
+    """
+    docs = [Counter(_bigrams(t["content"])) for t in tickets]
+    q_terms = list(dict.fromkeys(_bigrams(query)))
+    n = len(docs)
+    if n == 0 or not q_terms:
+        return {}
+    avgdl = sum(sum(d.values()) for d in docs) / n
+    df: Counter = Counter()
+    for d in docs:
+        for term in q_terms:
+            if term in d:
+                df[term] += 1
+    k1, b = 1.5, 0.75
+    scores: dict[str, float] = {}
+    for t, d in zip(tickets, docs):
+        dl = sum(d.values())
+        score = 0.0
+        for term in q_terms:
+            if term not in d:
+                continue
+            idf = math.log(1.0 + (n - df[term] + 0.5) / (df[term] + 0.5))
+            tf = d[term]
+            score += idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * dl / avgdl))
+        scores[t["id"]] = score
+    return scores
+
+
+def _rrf_fuse(rankings: list[list[str]], k: int = 60) -> list[str]:
+    """Reciprocal Rank Fusion：多路排名各自 1/(k+rank) 计分求和，返回融合后降序 id 列表。
+
+    RRF 只看名次不看分数量纲，向量距离与 BM25 分数无需归一即可融合。
+    """
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=lambda d: scores[d], reverse=True)
+
+
 def retrieve_evidence(query: str, top_k: int = 3) -> str:
+    """混合检索历史工单：BM25 + 语义/词面近邻双路 RRF 融合。
+
+    ChromaDB 可用: 向量(语义) + BM25(词面) 融合，engine=hybrid_vector_bm25;
+    ChromaDB 不可用: 降级 BM25 + Jaccard(均为词面) 融合，engine=hybrid_bm25_jaccard。
+    """
+    bm25_scores = _bm25_rank(query, _HISTORICAL_TICKETS)
+    bm25_ranking = [tid for tid, s in sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True) if s > 0]
+    local_by_id = {t["id"]: t for t in _HISTORICAL_TICKETS}
+
     coll = _get_chroma_collection()
     if coll is not None:
         try:
-            results = coll.query(query_texts=[query], n_results=top_k)
-            evidence = []
-            for i in range(len(results["ids"][0])):
-                evidence.append({
-                    "ticket_id": results["ids"][0][i],
+            results = coll.query(query_texts=[query], n_results=max(top_k * 2, top_k))
+            vector_ranking = list(results["ids"][0])
+            vector_meta = {
+                results["ids"][0][i]: {
                     "content": results["documents"][0][i] if results["documents"] else "",
                     "similarity": round(1.0 - (results["distances"][0][i] if results["distances"] else 0.0), 4),
                     "category": results["metadatas"][0][i].get("category", "") if results["metadatas"] else "",
                     "sub_category": results["metadatas"][0][i].get("sub", "") if results["metadatas"] else "",
                     "resolution": results["metadatas"][0][i].get("resolution", "") if results["metadatas"] else "",
-                })
-            logger.info("ChromaDB检索: query='%s' → %d条", query[:30], len(evidence))
-            return json.dumps({"evidence": evidence, "engine": "chromadb", "total_candidates": coll.count()}, ensure_ascii=False)
+                }
+                for i in range(len(results["ids"][0]))
+            }
+            fused = _rrf_fuse([vector_ranking, bm25_ranking])
+            # 融合结果不足 top_k 时按 Jaccard 顺序补齐（本地种子语料兜底）
+            for t in sorted(_HISTORICAL_TICKETS, key=lambda t: _jaccard_sim(query, t["content"]), reverse=True):
+                if len(fused) >= top_k:
+                    break
+                if t["id"] not in fused:
+                    fused.append(t["id"])
+            max_bm25 = max(bm25_scores.values(), default=0.0)
+            evidence = []
+            for tid in fused[:top_k]:
+                if tid in vector_meta:
+                    evidence.append({"ticket_id": tid, **vector_meta[tid]})
+                elif tid in local_by_id:
+                    t = local_by_id[tid]
+                    # 仅 BM25 命中的本地工单：相似度用归一化 BM25 分
+                    norm = bm25_scores.get(tid, 0.0) / max_bm25 if max_bm25 else 0.0
+                    evidence.append({
+                        "ticket_id": tid, "content": t["content"], "similarity": round(norm, 4),
+                        "category": t["category"], "sub_category": t.get("sub", ""), "resolution": t.get("resolution", ""),
+                    })
+            logger.info("混合检索(向量+BM25): query='%s' → %d条", query[:30], len(evidence))
+            return json.dumps({"evidence": evidence, "engine": "hybrid_vector_bm25", "total_candidates": coll.count()}, ensure_ascii=False)
         except Exception as e:
-            logger.warning("ChromaDB查询失败，降级Jaccard: %s", e)
+            logger.warning("ChromaDB查询失败，降级 BM25+Jaccard 混合检索: %s", e)
 
-    # Jaccard 降级 (与 dedup 采用一致的 char n-gram 口径)
-    scored = sorted([(_jaccard_sim(query, t["content"]), t) for t in _HISTORICAL_TICKETS], key=lambda x: x[0], reverse=True)
-    evidence = [{"ticket_id": t["id"], "content": t["content"], "similarity": round(s, 4), "category": t["category"], "sub_category": t.get("sub", ""), "resolution": t.get("resolution", "")} for s, t in scored[:top_k]]
-    return json.dumps({"evidence": evidence, "engine": "jaccard", "total_candidates": len(_HISTORICAL_TICKETS)}, ensure_ascii=False)
+    # 降级：BM25(精确词面) + Jaccard(n-gram 词面) 双路 RRF，两路同为词面但粒度不同
+    jac_ranking = [t["id"] for t in sorted(_HISTORICAL_TICKETS, key=lambda t: _jaccard_sim(query, t["content"]), reverse=True)]
+    fused = _rrf_fuse([bm25_ranking, jac_ranking])
+    evidence = []
+    for tid in fused[:top_k]:
+        t = local_by_id[tid]
+        evidence.append({
+            "ticket_id": tid, "content": t["content"], "similarity": round(_jaccard_sim(query, t["content"]), 4),
+            "category": t["category"], "sub_category": t.get("sub", ""), "resolution": t.get("resolution", ""),
+        })
+    return json.dumps({"evidence": evidence, "engine": "hybrid_bm25_jaccard", "total_candidates": len(_HISTORICAL_TICKETS)}, ensure_ascii=False)
 
 # ═══════════════════════════════════════════
 

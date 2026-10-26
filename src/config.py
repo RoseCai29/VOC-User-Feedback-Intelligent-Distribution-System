@@ -21,18 +21,17 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 1024
     llm_timeout: float = 30.0
     use_deterministic: bool = False
-    max_retries: int = 3
-    max_loop_count: int = 20
+    # 带证据重分类仅保留 1 轮：第 2 轮起证据同质、增量≈LLM 采样方差，性价比不足
+    max_retries: int = 1
     confidence_threshold: float = 0.7
     dedup_threshold: float = 0.75
-    # 分类通道: rules(纯规则) | semantic(纯LLM) | small(纯小模型) | cascade(小模型优先+LLM兜底)
-    # 默认 rules：真实 test 集实测 cascade L1 61.4% < rules 74.5%（小模型域偏移，见 README Known
-    # Limitations）。待真实标注重训 + 阈值重标定达标后再切回 cascade。
+    # 分类通道: rules(纯规则) | semantic(纯LLM) | cascade(小模型优先+LLM兜底)
+    # 默认 rules：级联端到端 L1 72.6% < rules 74.5%（瓶颈在 fast path 覆盖率 52.9%，见 README）。
+    # 小模型直出精度已达标（85.2% > 74.5%，bert_voc_v2 重训后 fast path 已开），
+    # 待标注回流扩大覆盖率、级联端到端追平规则基线后再切回 cascade。
     classifier_mode: str = "rules"
     cascade_fallback: str = "llm"                     # 小模型低置信时的兜底: llm | rules
-    small_model_type: str = "bert"                    # bert | linear
     small_model_path: str = "./data/models/bert_voc_v2"  # BERT 模型目录(真实标注重训版; 旧伪标签版为 bert_voc)
-    small_linear_model_path: str = "./data/models/small_clf.joblib"  # 线性模型基线
     small_model_category_threshold: float = 0.80      # 一级直出阈值(真实 test 验证: 直出 L1 85.2%)
     small_model_sub_threshold: float = 0.75           # 二级直出阈值(真实 test 验证: 直出 L2 75.3%)
     # fast path（仅 LLM 模式触发）：真实 test 实测双阈值直出 L1 85.2% / L2 75.3%（覆盖 52.9%），

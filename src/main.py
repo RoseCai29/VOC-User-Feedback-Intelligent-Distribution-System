@@ -89,7 +89,7 @@ if __name__ == "__main__":
         sep("LangGraph 图结构")
         print("  decision -> execute -> reflect -> (loop) -> END")
         print("  6 tools: classify|retrieve_evidence|dedup|route|push_service_guide|crawl_feedback")
-        print("  低置信自纠错: confidence<0.7 -> retrieve_evidence -> re-classify (max 3轮)")
+        print("  低置信自纠错: confidence<0.7 -> retrieve_evidence -> re-classify (max 1轮)")
         print("  启动 API: python -m src.main --mode server")
         print("  或: uvicorn src.api:app --reload")
     elif args.mode == "server":

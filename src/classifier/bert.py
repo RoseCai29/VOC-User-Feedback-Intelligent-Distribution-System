@@ -3,7 +3,7 @@ BERT 小模型 —— 共享编码器 + 双分类头。
 
 类别数由分类体系决定（当前 4 类 / 11 类），并把标签列表写入模型目录，
 加载旧模型时按保存时的标签列表还原，避免分类体系扩展后无法加载。
-与 LinearSmallModel 实现同一 SmallModel 协议，级联路由与 fast path 无需改动。
+与 SmallModel 协议一致，级联路由与 fast path 无需改动。
 默认主干使用 hfl/rbt3（3 层中文 RoBERTa），CPU 可训练、可推理；也可通过
 --backbone 换成 bert-base-chinese 等更大模型。
 """
